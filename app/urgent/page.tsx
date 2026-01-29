@@ -77,7 +77,7 @@ export default function UrgentPage() {
             setResult(null);
             setError(null);
           }}
-          style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+          style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ddd", background: "#fff", color: "#111" }}
         >
           Clear
         </button>

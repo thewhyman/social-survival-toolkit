@@ -76,7 +76,7 @@ export default function RewritePage() {
                         setResult(null);
                         setError(null);
                     }}
-                    style={{ background: "#111", color: "#fff", border: "1px solid #111" }}
+                    style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ddd", background: "#fff", color: "#111" }}
                 >
                     Clear
                 </button>
