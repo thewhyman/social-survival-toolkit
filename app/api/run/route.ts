@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 
 type Mode = "rewrite" | "urgent" | "send_check";
 
+/* ---------------- Utilities ---------------- */
+
 function clampText(s: string, maxChars: number) {
   s = (s || "").trim();
   if (s.length > maxChars) s = s.slice(0, maxChars);
@@ -9,16 +11,72 @@ function clampText(s: string, maxChars: number) {
 }
 
 function extractOutputText(data: any): string {
-  // Reliable for Responses API
-  const t =
+  return (
     data?.output?.[0]?.content?.find((c: any) => c.type === "output_text")?.text ??
     data?.output_text ??
-    "";
-  return typeof t === "string" ? t : "";
+    ""
+  );
 }
+
+/* ---------------- Rate Limiter (MVP) ---------------- */
+// Best-effort, in-memory limiter. Good enough for MVP.
+// Upgrade later to Redis / Vercel KV if needed.
+
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_REQ = 10;
+
+type Bucket = { count: number; resetAt: number };
+const buckets = new Map<string, Bucket>();
+
+function getClientIp(req: NextRequest): string {
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) return xff.split(",")[0].trim();
+  return req.headers.get("x-real-ip") ?? "unknown";
+}
+
+function rateLimit(ip: string) {
+  const now = Date.now();
+  const b = buckets.get(ip);
+
+  if (!b || now > b.resetAt) {
+    buckets.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return { ok: true, remaining: RATE_LIMIT_MAX_REQ - 1, resetInMs: RATE_LIMIT_WINDOW_MS };
+  }
+
+  if (b.count >= RATE_LIMIT_MAX_REQ) {
+    return { ok: false, remaining: 0, resetInMs: b.resetAt - now };
+  }
+
+  b.count += 1;
+  return { ok: true, remaining: RATE_LIMIT_MAX_REQ - b.count, resetInMs: b.resetAt - now };
+}
+
+/* ---------------- Route ---------------- */
 
 export async function POST(req: NextRequest) {
   try {
+    /* ---- Rate limit ---- */
+    const ip = getClientIp(req);
+    const rl = rateLimit(ip);
+
+    if (!rl.ok) {
+      return NextResponse.json(
+        {
+          error: "Rate limit exceeded. Try again shortly.",
+          retry_after_ms: rl.resetInMs,
+        },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(Math.ceil(rl.resetInMs / 1000)),
+            "X-RateLimit-Limit": String(RATE_LIMIT_MAX_REQ),
+            "X-RateLimit-Remaining": "0",
+          },
+        }
+      );
+    }
+
+    /* ---- Input ---- */
     const body = await req.json();
 
     const inputRaw = String(body?.input ?? "");
@@ -41,6 +99,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    /* ---- Prompt + Schema ---- */
     let system = "";
     let schema: any = {};
     let schemaName = "";
@@ -72,13 +131,13 @@ Be concise and non-alarmist.
       };
     } else if (mode === "send_check") {
       system = `
-You are a "send check" assistant. You help the user avoid sending messages they will regret.
+You are a "send check" assistant. Help the user avoid sending messages they will regret.
 
 Rules:
 - Be practical and non-judgmental.
-- Flag likely regret triggers (tone, escalation, permanence, power imbalance).
-- Keep the safer rewrite close to the original meaning.
-- If recommendation is "Send", safer_version must be an empty string.
+- Flag tone, escalation, permanence, or power imbalance.
+- Keep safer rewrites close to original meaning.
+- If recommendation is "Send", safer_version must be empty.
 `.trim();
 
       schemaName = "send_check";
@@ -102,7 +161,7 @@ You are a communication rewrite assistant.
 Rewrite the user's message in 3 variants: Polite, Neutral, Warm.
 
 Rules:
-- Keep the same intent and content (do not add new commitments).
+- Keep the same intent and content.
 - Keep it concise.
 - Avoid corporate fluff.
 `.trim();
@@ -120,6 +179,7 @@ Rules:
       };
     }
 
+    /* ---- OpenAI call ---- */
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -150,8 +210,8 @@ Rules:
     }
 
     const data = await r.json();
-
     const raw = extractOutputText(data);
+
     if (!raw) {
       return NextResponse.json({ error: "Empty model output", data }, { status: 500 });
     }
@@ -161,12 +221,21 @@ Rules:
       parsed = JSON.parse(raw);
     } catch {
       return NextResponse.json(
-        { error: "Model returned non-JSON", raw, data },
+        { error: "Model returned non-JSON", raw },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ result: parsed });
+    /* ---- Success ---- */
+    return NextResponse.json(
+      { result: parsed },
+      {
+        headers: {
+          "X-RateLimit-Limit": String(RATE_LIMIT_MAX_REQ),
+          "X-RateLimit-Remaining": String(rl.remaining),
+        },
+      }
+    );
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }
