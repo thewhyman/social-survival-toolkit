@@ -5,12 +5,12 @@ export default function Home() {
       <p>Paste a message. Get the least-wrong next move.</p>
 
       <ul>
-        <li>✏️ Rewrite so I don’t sound like a jerk</li>
-        <a href="/rewrite" style={{ display: "inline-block", marginTop: 12 }}>
-          Go to Rewrite Tool →
-        </a>
-        <li>🚨 Is this urgent or just loud?</li>
-        <li>⚠️ Am I about to regret sending this?</li>
+      <li><a href="/rewrite" style={{ display: "inline-block", marginTop: 12 }}>
+        ✏️ Rewrite so I don’t sound like a jerk
+        </a></li>
+        
+        <li><a href="/urgent">🚨 Is this urgent or just loud?</a></li>
+        <li><a href="/send-check">⚠️ Am I about to regret sending this?</a></li>
       </ul>
     </main>
   );
