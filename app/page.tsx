@@ -6,6 +6,9 @@ export default function Home() {
 
       <ul>
         <li>✏️ Rewrite so I don’t sound like a jerk</li>
+        <a href="/rewrite" style={{ display: "inline-block", marginTop: 12 }}>
+          Go to Rewrite Tool →
+        </a>
         <li>🚨 Is this urgent or just loud?</li>
         <li>⚠️ Am I about to regret sending this?</li>
       </ul>
