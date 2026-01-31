@@ -1,6 +1,9 @@
+import AuthBar from "./components/AuthBar";
+
 export default function Home() {
   return (
     <main style={{ padding: 40, fontFamily: "sans-serif" }}>
+      <AuthBar />
       <h1>Social Survival Toolkit</h1>
       <p>Paste a message. Get the least-wrong next move.</p>
 

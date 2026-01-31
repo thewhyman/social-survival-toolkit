@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { auth, clerkClient } from "@clerk/nextjs/server";
 
 type Mode = "rewrite" | "urgent" | "send_check";
 
@@ -18,58 +19,130 @@ function extractOutputText(data: any): string {
   );
 }
 
-/* ---------------- Rate Limiter (MVP) ---------------- */
-// Best-effort, in-memory limiter. Good enough for MVP.
-// Upgrade later to Redis / Vercel KV if needed.
-
-const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
-const RATE_LIMIT_MAX_REQ = 10;
-
-type Bucket = { count: number; resetAt: number };
-const buckets = new Map<string, Bucket>();
-
 function getClientIp(req: NextRequest): string {
   const xff = req.headers.get("x-forwarded-for");
   if (xff) return xff.split(",")[0].trim();
   return req.headers.get("x-real-ip") ?? "unknown";
 }
 
-function rateLimit(ip: string) {
+/* ---------------- Rate Limiter (MVP, in-memory) ----------------
+   Windows are rolling.
+   Anonymous:
+     - 3 / minute
+     - 5 / day
+   Signed-in:
+     - 10 / minute
+     - 50 / day
+------------------------------------------------------------------ */
+
+type Bucket = { count: number; resetAt: number };
+
+const buckets1m = new Map<string, Bucket>();
+const buckets1d = new Map<string, Bucket>();
+
+const WINDOW_1M_MS = 60_000;
+const WINDOW_1D_MS = 86_400_000;
+
+const ANON_PER_MIN = 3;
+const ANON_PER_DAY = 5;
+
+const SIGNED_IN_FREE_PER_MIN = 10;
+const SIGNED_IN_FREE_PER_DAY = 50;
+
+const SIGNED_IN_PRO_PER_MIN = 100;
+const SIGNED_IN_PRO_PER_DAY = 1000;
+
+
+
+function consume(
+  map: Map<string, Bucket>,
+  key: string,
+  limit: number,
+  windowMs: number
+) {
   const now = Date.now();
-  const b = buckets.get(ip);
+  const b = map.get(key);
 
   if (!b || now > b.resetAt) {
-    buckets.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
-    return { ok: true, remaining: RATE_LIMIT_MAX_REQ - 1, resetInMs: RATE_LIMIT_WINDOW_MS };
+    map.set(key, { count: 1, resetAt: now + windowMs });
+    return { ok: true, remaining: limit - 1, resetInMs: windowMs, limit };
   }
 
-  if (b.count >= RATE_LIMIT_MAX_REQ) {
-    return { ok: false, remaining: 0, resetInMs: b.resetAt - now };
+  if (b.count >= limit) {
+    return { ok: false, remaining: 0, resetInMs: b.resetAt - now, limit };
   }
 
   b.count += 1;
-  return { ok: true, remaining: RATE_LIMIT_MAX_REQ - b.count, resetInMs: b.resetAt - now };
+  return { ok: true, remaining: limit - b.count, resetInMs: b.resetAt - now, limit };
 }
 
 /* ---------------- Route ---------------- */
 
 export async function POST(req: NextRequest) {
   try {
-    /* ---- Rate limit ---- */
     const ip = getClientIp(req);
-    const rl = rateLimit(ip);
+    const { userId } = await auth();
 
-    if (!rl.ok) {
+    let plan: "free" | "pro" = "free";
+    if (userId) {
+      const client = await clerkClient();
+      const user = await client.users.getUser(userId);
+      if (user.publicMetadata?.plan === "pro") plan = "pro";
+    }
+
+    const perMinLimit = userId
+      ? plan === "pro"
+        ? SIGNED_IN_PRO_PER_MIN
+        : SIGNED_IN_FREE_PER_MIN
+      : ANON_PER_MIN;
+
+    const perDayLimit = userId
+      ? plan === "pro"
+        ? SIGNED_IN_PRO_PER_DAY
+        : SIGNED_IN_FREE_PER_DAY
+      : ANON_PER_DAY;
+
+    // Stable identity key
+    const key = userId ? `user:${userId}` : `ip:${ip}`;
+
+    /* ---- Per-minute limit ---- */
+    const rlMin = consume(buckets1m, `1m:${key}`, perMinLimit, WINDOW_1M_MS);
+
+    if (!rlMin.ok) {
       return NextResponse.json(
         {
-          error: "Rate limit exceeded. Try again shortly.",
-          retry_after_ms: rl.resetInMs,
+          error: "Rate limit exceeded (per minute). Try again shortly.",
+          retry_after_ms: rlMin.resetInMs,
         },
         {
           status: 429,
           headers: {
-            "Retry-After": String(Math.ceil(rl.resetInMs / 1000)),
-            "X-RateLimit-Limit": String(RATE_LIMIT_MAX_REQ),
+            "Retry-After": String(Math.ceil(rlMin.resetInMs / 1000)),
+            "X-RateLimit-Window": "1m",
+            "X-RateLimit-Limit": String(rlMin.limit),
+            "X-RateLimit-Remaining": "0",
+          },
+        }
+      );
+    }
+
+    /* ---- Per-day limit (both anon + signed-in) ---- */
+    const rlDay = consume(buckets1d, `1d:${key}`, perDayLimit, WINDOW_1D_MS);
+
+    if (!rlDay.ok) {
+      return NextResponse.json(
+        {
+          error: userId
+            ? "Daily limit reached. Come back tomorrow."
+            : "Daily limit reached. Sign up for more.",
+          retry_after_ms: rlDay.resetInMs,
+        },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(Math.ceil(rlDay.resetInMs / 1000)),
+            "X-RateLimit-Window": "1d",
+            "X-RateLimit-Limit": String(rlDay.limit),
             "X-RateLimit-Remaining": "0",
           },
         }
@@ -93,10 +166,7 @@ export async function POST(req: NextRequest) {
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json(
-        { error: "Missing OPENAI_API_KEY on server" },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Missing OPENAI_API_KEY" }, { status: 500 });
     }
 
     /* ---- Prompt + Schema ---- */
@@ -114,8 +184,6 @@ Labels (choose one exactly):
 - Artificial urgency
 - Someone else's stress
 - Need more context
-
-Be concise and non-alarmist.
 `.trim();
 
       schemaName = "urgent_triage";
@@ -131,13 +199,8 @@ Be concise and non-alarmist.
       };
     } else if (mode === "send_check") {
       system = `
-You are a "send check" assistant. Help the user avoid sending messages they will regret.
-
-Rules:
-- Be practical and non-judgmental.
-- Flag tone, escalation, permanence, or power imbalance.
-- Keep safer rewrites close to original meaning.
-- If recommendation is "Send", safer_version must be empty.
+You are a "send check" assistant.
+Help the user avoid sending messages they will regret.
 `.trim();
 
       schemaName = "send_check";
@@ -146,10 +209,7 @@ Rules:
         properties: {
           risk_level: { type: "string", enum: ["Low", "Medium", "High"] },
           flags: { type: "array", items: { type: "string" }, maxItems: 4 },
-          recommendation: {
-            type: "string",
-            enum: ["Send", "Rewrite", "Wait 24 hours"],
-          },
+          recommendation: { type: "string", enum: ["Send", "Rewrite", "Wait 24 hours"] },
           safer_version: { type: "string" },
         },
         required: ["risk_level", "flags", "recommendation", "safer_version"],
@@ -157,13 +217,8 @@ Rules:
       };
     } else {
       system = `
-You are a communication rewrite assistant.
-Rewrite the user's message in 3 variants: Polite, Neutral, Warm.
-
-Rules:
-- Keep the same intent and content.
-- Keep it concise.
-- Avoid corporate fluff.
+Rewrite the user's message in 3 variants:
+Polite, Neutral, Warm.
 `.trim();
 
       schemaName = "rewrite_variants";
@@ -179,7 +234,7 @@ Rules:
       };
     }
 
-    /* ---- OpenAI call ---- */
+    /* ---- OpenAI ---- */
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -206,33 +261,21 @@ Rules:
 
     if (!r.ok) {
       const text = await r.text();
-      return NextResponse.json({ error: `OpenAI error: ${text}` }, { status: 500 });
+      return NextResponse.json({ error: text }, { status: 500 });
     }
 
     const data = await r.json();
     const raw = extractOutputText(data);
+    const parsed = JSON.parse(raw);
 
-    if (!raw) {
-      return NextResponse.json({ error: "Empty model output", data }, { status: 500 });
-    }
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return NextResponse.json(
-        { error: "Model returned non-JSON", raw },
-        { status: 500 }
-      );
-    }
-
-    /* ---- Success ---- */
     return NextResponse.json(
       { result: parsed },
       {
         headers: {
-          "X-RateLimit-Limit": String(RATE_LIMIT_MAX_REQ),
-          "X-RateLimit-Remaining": String(rl.remaining),
+          "X-RateLimit-1m-Limit": String(rlMin.limit),
+          "X-RateLimit-1m-Remaining": String(rlMin.remaining),
+          "X-RateLimit-1d-Limit": String(rlDay.limit),
+          "X-RateLimit-1d-Remaining": String(rlDay.remaining),
         },
       }
     );
