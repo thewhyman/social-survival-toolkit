@@ -16,7 +16,7 @@ export async function POST() {
     const { userId } = await auth();
     if (!userId) return NextResponse.json({ error: "Unauthorized (not signed in)" }, { status: 401 });
 
-    const stripe = new Stripe(sk, { apiVersion: "2024-06-20" });
+    const stripe = new Stripe(sk, { apiVersion: "2026-01-28.clover" });
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
